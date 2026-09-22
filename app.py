@@ -262,7 +262,8 @@ def build_graph(center_lat, center_lon, radius_m):
     """Download + weight the road graph. Cached per (rounded center, radius)
     so repeated requests for the same area don't re-hit OSM."""
     G = _download_graph_with_retries(center_lat, center_lon, radius_m)
-    G = ox.routing.add_edge_speeds(G)
+    G = ox.routing.add_edge_speeds(G, fallback=30)  # 30 kph default for untagged roads,
+                                                      # matches compute_edge_weights' own default
     G = ox.routing.add_edge_travel_times(G)
 
     node_degree = dict(G.degree())
@@ -523,7 +524,7 @@ if result is not None:
         st.caption(traffic_note)
 
     m = folium.Map(location=(G.nodes[origin]["y"], G.nodes[origin]["x"]),
-                    zoom_start=14, tiles="cartodbpositron")
+                    zoom_start=14, tiles="OpenStreetMap")
     for path in pareto_routes:
         folium.PolyLine(path_to_coords(G, path), color="#93c5fd", weight=3, opacity=0.5).add_to(m)
     folium.PolyLine(path_to_coords(G, baseline_path), color="#6b7280", weight=4,

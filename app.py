@@ -227,12 +227,41 @@ class RouteDuplicateElimination(ElementwiseDuplicateElimination):
 # Cached graph construction
 # ----------------------------------------------------------------------------
 
+# The main overpass-api.de instance is a shared free public service and is
+# frequently overloaded / briefly refuses connections. Retry across a few
+# known public mirrors with backoff before giving up, instead of failing on
+# the first hiccup.
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+]
+
+
+def _download_graph_with_retries(center_lat, center_lon, radius_m, attempts_per_mirror=2):
+    last_err = None
+    for mirror in OVERPASS_MIRRORS:
+        ox.settings.overpass_url = mirror
+        ox.settings.overpass_endpoint = mirror
+        for attempt in range(attempts_per_mirror):
+            try:
+                return ox.graph_from_point((center_lat, center_lon), dist=radius_m,
+                                            network_type="drive")
+            except Exception as e:
+                last_err = e
+                time_module.sleep(2 * (attempt + 1))  # brief backoff before retrying
+    raise ConnectionError(
+        "Couldn't reach any OpenStreetMap road-data server after several tries "
+        f"(last error: {last_err}). This is usually a temporary outage on their "
+        "free public service — please wait a minute and try again."
+    )
+
 
 @st.cache_resource(show_spinner=False)
 def build_graph(center_lat, center_lon, radius_m):
     """Download + weight the road graph. Cached per (rounded center, radius)
     so repeated requests for the same area don't re-hit OSM."""
-    G = ox.graph_from_point((center_lat, center_lon), dist=radius_m, network_type="drive")
+    G = _download_graph_with_retries(center_lat, center_lon, radius_m)
     G = ox.routing.add_edge_speeds(G)
     G = ox.routing.add_edge_travel_times(G)
 
@@ -248,7 +277,17 @@ def build_graph(center_lat, center_lon, radius_m):
 
 @st.cache_resource(show_spinner=False)
 def geocode_place(query):
-    return ox.geocode(query)
+    last_err = None
+    for attempt in range(3):
+        try:
+            return ox.geocode(query)
+        except Exception as e:
+            last_err = e
+            time_module.sleep(2 * (attempt + 1))
+    raise ConnectionError(
+        f"Couldn't geocode '{query}' after several tries (last error: {last_err}). "
+        "The geocoding service may be temporarily unavailable — try again shortly."
+    )
 
 
 # ----------------------------------------------------------------------------

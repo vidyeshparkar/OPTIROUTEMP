@@ -8,3 +8,4 @@ streamlit-folium>=0.20
 matplotlib>=3.8
 pandas>=2.1
 requests>=2.31
+scikit-learn>=1.3

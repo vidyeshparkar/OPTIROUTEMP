@@ -1,0 +1,10 @@
+streamlit>=1.32
+osmnx>=1.9
+networkx>=3.2
+numpy>=1.26
+pymoo>=0.6.1
+folium>=0.15
+streamlit-folium>=0.20
+matplotlib>=3.8
+pandas>=2.1
+requests>=2.31

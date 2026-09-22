@@ -296,13 +296,14 @@ def geocode_place(query):
 # ----------------------------------------------------------------------------
 
 
-def apply_live_traffic(G, pareto_routes, api_key):
-    """Re-fetch current speed for edges on the Pareto routes only, and return
-    an updated pareto_costs array. Never raises — falls back silently per edge."""
+def apply_live_traffic(G, routes, api_key):
+    """Re-fetch current speed for edges on the given routes only, and return an
+    array of updated costs (one row per route, same order as `routes`).
+    Never raises — falls back silently per edge on any API failure."""
     import requests
 
     edges_seen = set()
-    for path in pareto_routes:
+    for path in routes:
         for u, v in zip(path[:-1], path[1:]):
             edges_seen.add((u, v))
 
@@ -327,7 +328,7 @@ def apply_live_traffic(G, pareto_routes, api_key):
             continue  # silent fallback to static time for this edge
 
     new_costs = []
-    for path in pareto_routes:
+    for path in routes:
         totals = np.zeros(4)
         for u, v in zip(path[:-1], path[1:]):
             d = best_parallel_edge(G, u, v, weight="time")
@@ -506,18 +507,23 @@ if result is not None:
     baseline_path = result["baseline_path"]
     origin, dest = result["origin"], result["dest"]
 
+    baseline_cost = route_cost(G, baseline_path)
+
     traffic_note = None
     if use_traffic and tomtom_key:
         try:
             with st.spinner("Fetching live traffic for candidate routes..."):
-                new_costs, n_updated = apply_live_traffic(G, pareto_routes, tomtom_key)
-            pareto_costs = new_costs
-            traffic_note = f"Live traffic applied to {n_updated} road segments."
+                # Include baseline in the same lookup so it's judged on the same
+                # real-time basis as the Pareto routes, not left on static speed-limit time.
+                all_routes = pareto_routes + [baseline_path]
+                new_costs, n_updated = apply_live_traffic(G, all_routes, tomtom_key)
+            pareto_costs = new_costs[:-1]
+            baseline_cost = new_costs[-1]
+            traffic_note = f"Live traffic applied to {n_updated} road segments (including baseline)."
         except Exception:
             traffic_note = "Live traffic lookup failed — showing static speed-limit times."
 
     best_idx, best_path, best_cost = recommend_route(pareto_costs, pareto_routes, priority_weights)
-    baseline_cost = route_cost(G, baseline_path)
 
     st.subheader("Recommended route")
     if traffic_note:

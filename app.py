@@ -40,7 +40,7 @@ MAX_RADIUS_M = 15000
 DEFAULT_RADIUS_M = 6000
 N_GEN = 25  # NSGA-III generations. Kept lower than the notebook's 30 for web
             # response time; still gives the algorithm room to converge on a
-            # graph of this size. Adjust if you need faster/slower trade-offs.
+            # graph of this size. Adjust if you need faster/slower trade-offs. vidu
 
 PRIORITY_PRESETS = {
     "Fastest": (1.0, 0.0, 0.0, 0.0),

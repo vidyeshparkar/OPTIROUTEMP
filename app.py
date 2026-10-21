@@ -273,6 +273,8 @@ class RouteDuplicateElimination(ElementwiseDuplicateElimination):
 # the first hiccup.
 OVERPASS_MIRRORS = [
     "https://overpass-api.de/api",
+    "https://overpass.private.coffee/api",
+    "https://overpass.openstreetmap.fr/api",
     "https://overpass.kumi.systems/api",
     "https://lz4.overpass-api.de/api",
 ]
@@ -280,6 +282,7 @@ OVERPASS_MIRRORS = [
 
 def _download_graph_with_retries(center_lat, center_lon, radius_m, attempts_per_mirror=2):
     last_err = None
+    failures = []
     for mirror in OVERPASS_MIRRORS:
         ox.settings.overpass_url = mirror
         ox.settings.overpass_endpoint = "interpreter"
@@ -289,10 +292,11 @@ def _download_graph_with_retries(center_lat, center_lon, radius_m, attempts_per_
                                             network_type="drive")
             except Exception as e:
                 last_err = e
-                time_module.sleep(2 * (attempt + 1))  # brief backoff before retrying
+                failures.append(mirror.split('//')[1].split('/')[0] + ": " + type(e).__name__)
+                time_module.sleep(1 + attempt)  # brief backoff before retrying
     raise ConnectionError(
         "Couldn't reach any OpenStreetMap road-data server after several tries "
-        f"(last error: {last_err}). This is usually a temporary outage on their "
+        f"(failed: {'; '.join(dict.fromkeys(failures))}). This is usually a temporary outage on their "
         "free public service — please wait a minute and try again."
     )
 

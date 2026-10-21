@@ -38,7 +38,7 @@ np.random.seed(42)
 
 MAX_RADIUS_M = 15000
 DEFAULT_RADIUS_M = 6000
-N_GEN = 25  # NSGA-III generations. Kept lower than the notebook's 30 for web
+N_GEN = 20  # NSGA-III generations. Kept lower than the notebook's 30 for web
             # response time; still gives the algorithm room to converge on a
             # graph of this size. Adjust if you need faster/slower trade-offs.
 
@@ -124,13 +124,31 @@ def route_cost(G, path):
 
 
 def weighted_edge_cost(weights):
-    wt, wd, wf, wr = weights
+    """Weight function for the simplified search graph H. Each edge carries
+    pre-normalized (time, distance, fuel, risk) in d["v"], so all four
+    objectives matter equally regardless of their units."""
+    wt, wd, wf, wr = (float(x) for x in weights)
 
-    def _cost(u, v, data):
-        d = min(data.values(), key=lambda e: e.get("time", 1e9))
-        return wt * d["time"] + wd * d["distance"] + wf * d["fuel"] + wr * d["risk"]
+    def _cost(u, v, d):
+        a, b, c, e = d["v"]
+        return wt * a + wd * b + wf * c + wr * e
 
     return _cost
+
+
+def build_search_graph(G):
+    """Collapse parallel edges (keep fastest) into a plain DiGraph and
+    normalize each objective by its mean, for much faster shortest paths."""
+    H = nx.DiGraph()
+    for u, v, d in G.edges(data=True):
+        if H.has_edge(u, v) and H[u][v]["raw"][0] <= d["time"]:
+            continue
+        H.add_edge(u, v, raw=(d["time"], d["distance"], d["fuel"], d["risk"]))
+    raws = np.array([e["raw"] for _, _, e in H.edges(data=True)])
+    means = np.where(raws.mean(axis=0) == 0, 1.0, raws.mean(axis=0))
+    for _, _, e in H.edges(data=True):
+        e["v"] = tuple(r / m for r, m in zip(e["raw"], means))
+    return H
 
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -145,6 +163,19 @@ def haversine_m(lat1, lon1, lat2, lon2):
 # --- NSGA-III custom operators (identical logic to the notebook, but the
 # A*-seed baseline path is now passed in explicitly instead of read from a
 # module-level global, so a fresh problem/algorithm can be built per request) ---
+
+
+def remove_loops(path):
+    """Cut any cycle out of a node path (keeps first visit of each node)."""
+    out, pos = [], {}
+    for n in path:
+        if n in pos:
+            out = out[:pos[n] + 1]
+            pos = {m: i for i, m in enumerate(out)}
+        else:
+            pos[n] = len(out)
+            out.append(n)
+    return out
 
 
 def random_weights():
@@ -169,15 +200,15 @@ def seeded_route(G, base_path, jitter=0.3):
     try:
         w = random_weights()
         sub = nx.shortest_path(G, base_path[i], base_path[j], weight=weighted_edge_cost(w))
-        return base_path[:i] + sub + base_path[j + 1:]
+        return remove_loops(base_path[:i] + sub + base_path[j + 1:])
     except nx.NetworkXNoPath:
         return list(base_path)
 
 
 class RouteProblem(Problem):
-    def __init__(self, G, origin, dest):
+    def __init__(self, G, H, origin, dest):
         super().__init__(n_var=1, n_obj=4, n_ieq_constr=0, xl=None, xu=None)
-        self.G, self.origin, self.dest = G, origin, dest
+        self.G, self.H, self.origin, self.dest = G, H, origin, dest
 
     def _evaluate(self, X, out, *args, **kwargs):
         out["F"] = np.array([route_cost(self.G, x[0]) for x in X])
@@ -192,9 +223,9 @@ class RouteSampling(Sampling):
         X = np.empty((n_samples, 1), dtype=object)
         for i in range(n_samples):
             if i % 2 == 0:
-                X[i, 0] = seeded_route(problem.G, self.baseline_path)
+                X[i, 0] = seeded_route(problem.H, self.baseline_path)
             else:
-                r = random_route(problem.G, problem.origin, problem.dest)
+                r = random_route(problem.H, problem.origin, problem.dest)
                 X[i, 0] = r if r is not None else list(self.baseline_path)
         return X
 
@@ -212,8 +243,8 @@ class RouteCrossover(Crossover):
             if common:
                 node = random.choice(list(common))
                 i1, i2 = p1.index(node), p2.index(node)
-                Y[0, m, 0] = p1[:i1] + p2[i2:]
-                Y[1, m, 0] = p2[:i2] + p1[i1:]
+                Y[0, m, 0] = remove_loops(p1[:i1] + p2[i2:])
+                Y[1, m, 0] = remove_loops(p2[:i2] + p1[i1:])
             else:
                 Y[0, m, 0] = list(p1)
                 Y[1, m, 0] = list(p2)
@@ -223,7 +254,7 @@ class RouteCrossover(Crossover):
 class RouteMutation(Mutation):
     def _do(self, problem, X, **kwargs):
         for i in range(len(X)):
-            X[i, 0] = seeded_route(problem.G, X[i, 0], jitter=0.5)
+            X[i, 0] = seeded_route(problem.H, X[i, 0], jitter=0.5)
         return X
 
 
@@ -406,7 +437,7 @@ def run_pipeline(from_query, to_query, radius_m, traffic_key=None):
 
     baseline_path = nx.astar_path(G, origin, dest, heuristic=euclid, weight="distance")
 
-    ref_dirs = get_reference_directions("das-dennis", 4, n_partitions=6)
+    ref_dirs = get_reference_directions("das-dennis", 4, n_partitions=4)
     pop_size = len(ref_dirs)
 
     algorithm = NSGA3(
@@ -417,7 +448,7 @@ def run_pipeline(from_query, to_query, radius_m, traffic_key=None):
         mutation=RouteMutation(),
         eliminate_duplicates=RouteDuplicateElimination(),
     )
-    problem = RouteProblem(G, origin, dest)
+    problem = RouteProblem(G, build_search_graph(G), origin, dest)
     res = minimize(problem, algorithm, ("n_gen", N_GEN), seed=1, verbose=False)
 
     pareto_routes, pareto_costs, seen = [], [], set()

@@ -33,6 +33,8 @@ from pymoo.util.ref_dirs import get_reference_directions
 # ----------------------------------------------------------------------------
 
 ox.settings.log_console = False
+ox.settings.requests_timeout = 40        # fail fast instead of hanging ~3 min per server
+ox.settings.overpass_rate_limit = False  # don't wait on mirror status/slot checks
 random.seed(42)
 np.random.seed(42)
 
@@ -280,7 +282,7 @@ OVERPASS_MIRRORS = [
 ]
 
 
-def _download_graph_with_retries(center_lat, center_lon, radius_m, attempts_per_mirror=2):
+def _download_graph_with_retries(center_lat, center_lon, radius_m, attempts_per_mirror=1):
     last_err = None
     failures = []
     for mirror in OVERPASS_MIRRORS:

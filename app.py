@@ -63,6 +63,12 @@ REF_SPEED_KPH = 50.0
 SPEED_POWER = 2.0        # Nilsson Power Model exponent for injury crashes (4 for fatal)
 JUNCTION_PENALTY = 0.3   # extra relative risk per km at the busiest junction density
 
+# Junction / signal delays (ASSUMED averages, tune for your city). Added to every
+# road segment for the junction it leads into.
+SIGNAL_DELAY_S = 25.0     # average wait at a traffic signal
+JUNCTION_DELAY_S = 8.0    # average slowdown at a busy unsignalled junction (4+ roads)
+IDLE_G_CO2_PER_S = 0.5    # approx. idling emissions, g CO2 per second waited
+
 st.set_page_config(page_title="OptiRoute", page_icon="🚗", layout="wide")
 
 # ----------------------------------------------------------------------------
@@ -110,6 +116,32 @@ def compute_edge_weights(u, v, data, node_degree):
     accident_risk = edge_risk(length_m, speed_kph, highway_type(data), junction_density)
 
     return time_s, distance_m, fuel_cost, accident_risk
+
+
+def emission_factor(speed_kph):
+    """COPERT-style g CO2 per km at a given average speed (approximate)."""
+    v = max(speed_kph, 5.0)
+    return 85 + 800 / v + 0.0035 * v ** 2
+
+
+def add_junction_delays(G):
+    """Add a wait at the junction each segment leads into: traffic signals
+    (tagged in OpenStreetMap) and busy junctions. Stores the pure driving time
+    in d["t_move"] and the wait in d["delay"], and adds both to time and fuel."""
+    deg = dict(G.degree())  # counts in + out roads, so a 4-way two-way crossing = 8
+    for u, v, k, d in G.edges(keys=True, data=True):
+        hw = G.nodes[v].get("highway")
+        hw = " ".join(map(str, hw)) if isinstance(hw, list) else str(hw)
+        if "traffic_signals" in hw:
+            delay = SIGNAL_DELAY_S
+        elif deg.get(v, 0) >= 8:
+            delay = JUNCTION_DELAY_S
+        else:
+            delay = 0.0
+        d["t_move"] = d["time"]
+        d["delay"] = delay
+        d["time"] += delay
+        d["fuel"] += delay * IDLE_G_CO2_PER_S
 
 
 def best_parallel_edge(G, u, v, weight="time"):
@@ -299,6 +331,7 @@ def build_graph(center_lat, center_lon, radius_m):
         data["distance"] = d
         data["fuel"] = f
         data["risk"] = r
+    add_junction_delays(G)
     return G
 
 
@@ -315,6 +348,7 @@ def load_local_graph():
     for u, v, k, data in G.edges(keys=True, data=True):
         t, d, f_, r = compute_edge_weights(u, v, data, node_degree)
         data["time"], data["distance"], data["fuel"], data["risk"] = t, d, f_, r
+    add_junction_delays(G)
     ids = np.array(list(G.nodes))
     lat = np.array([G.nodes[n]["y"] for n in ids])
     lon = np.array([G.nodes[n]["x"] for n in ids])
@@ -356,9 +390,9 @@ def geocode_place(query):
 
 
 def apply_traffic_factors(G, api_key, n_samples=40):
-    """Sample TomTom at ~n_samples nodes, compute congestion factor
-    (current / free-flow speed), give each edge its nearest sample's factor,
-    and rescale time + fuel BEFORE optimization. Mutates G (pass a copy)."""
+    """Sample TomTom at ~n_samples nodes (congestion = current / free-flow speed),
+    give each edge its nearest sample, and set its speed from TomTom's free-flow
+    speed x congestion BEFORE optimization. Mutates G (pass a copy)."""
     import requests
     from concurrent.futures import ThreadPoolExecutor
 
@@ -375,7 +409,7 @@ def apply_traffic_factors(G, api_key, n_samples=40):
             seg = r.json()["flowSegmentData"]
             cur, free = seg["currentSpeed"], seg["freeFlowSpeed"]
             if cur > 0 and free > 0:
-                return lat, lon, min(cur / free, 1.0)
+                return lat, lon, min(cur / free, 1.0), free
         except Exception:
             pass
         return None
@@ -387,15 +421,23 @@ def apply_traffic_factors(G, api_key, n_samples=40):
 
     pts = np.array([(g[0], g[1]) for g in got])
     factors = np.array([g[2] for g in got])
+    frees = np.array([g[3] for g in got])
     for u, v, k, d in G.edges(keys=True, data=True):
         lat = (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2
         lon = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
         i = int(np.argmin((pts[:, 0] - lat) ** 2 + (pts[:, 1] - lon) ** 2))
-        f = max(factors[i], 0.15)
-        d["time"] = d["time"] / f
-        eff = max(d["distance"] / d["time"] * 3.6, 5.0)  # effective kph
-        d["fuel"] = d["distance"] / 1000 * (85 + 800 / eff + 0.0035 * eff ** 2)
-        d["risk"] = edge_risk(d["distance"], eff, highway_type(d), d.get("jd", 0.5))
+        f = max(factors[i], 0.15)                      # congestion: 1 = free flow
+        t_move = d.get("t_move", d["time"])
+        delay = d.get("delay", 0.0)
+        osm_kph = max(d["distance"] / t_move * 3.6, 5.0) if t_move > 0 else 30.0
+        # TomTom's real free-flow speed replaces the OpenStreetMap limit when the
+        # limit is higher (optimistic); then apply the live slowdown.
+        eff_kph = max(min(osm_kph, frees[i]) * f, 4.0)
+        delay_now = delay * (1 + 2 * (1 - f))          # queues at signals grow in traffic
+        d["time"] = d["distance"] / (eff_kph / 3.6) + delay_now
+        d["fuel"] = (d["distance"] / 1000 * emission_factor(eff_kph)
+                     + delay_now * IDLE_G_CO2_PER_S)
+        d["risk"] = edge_risk(d["distance"], eff_kph, highway_type(d), d.get("jd", 0.5))
     return f"Live traffic applied from {len(got)} sample points before route search."
 
 

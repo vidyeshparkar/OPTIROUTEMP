@@ -40,7 +40,7 @@ MAX_RADIUS_M = 15000
 DEFAULT_RADIUS_M = 6000
 N_GEN = 25  # NSGA-III generations. Kept lower than the notebook's 30 for web
             # response time; still gives the algorithm room to converge on a
-            # graph of this size. Adjust if you need faster/slower trade-offs. vidu
+            # graph of this size. Adjust if you need faster/slower trade-offs.
 
 PRIORITY_PRESETS = {
     "Fastest": (1.0, 0.0, 0.0, 0.0),
@@ -50,10 +50,16 @@ PRIORITY_PRESETS = {
     "Balanced": (0.25, 0.25, 0.25, 0.25),
 }
 
-HIGHWAY_RISK = {
-    "motorway": 0.95, "trunk": 0.85, "primary": 0.65, "secondary": 0.5,
-    "tertiary": 0.35, "residential": 0.15, "living_street": 0.08, "unclassified": 0.35,
+# Relative base crash rate per vehicle-km at the reference speed, by road type.
+# ASSUMED values (illustrative, HSM-style: motorways safest per km, urban
+# streets higher). Replace with local crash data if available.
+HIGHWAY_BASE_RISK = {
+    "motorway": 0.4, "trunk": 0.7, "primary": 0.9, "secondary": 1.0,
+    "tertiary": 1.0, "unclassified": 1.0, "residential": 1.0, "living_street": 0.8,
 }
+REF_SPEED_KPH = 50.0
+SPEED_POWER = 2.0        # Nilsson Power Model exponent for injury crashes (4 for fatal)
+JUNCTION_PENALTY = 0.3   # extra relative risk per km at the busiest junction density
 
 st.set_page_config(page_title="OptiRoute", page_icon="🚗", layout="wide")
 
@@ -71,6 +77,16 @@ def highway_type(data):
     return h
 
 
+def edge_risk(length_m, speed_kph, hw, junction_density):
+    """Relative accident risk: base rate by road type x Power Model speed
+    factor + junction penalty, scaled by length. A relative index, not a
+    probability."""
+    v = max(speed_kph, 5.0)
+    base = HIGHWAY_BASE_RISK.get(hw, 1.0)
+    per_km = base * (v / REF_SPEED_KPH) ** SPEED_POWER + JUNCTION_PENALTY * junction_density
+    return (length_m / 1000) * per_km
+
+
 def compute_edge_weights(u, v, data, node_degree):
     length_m = data.get("length", 1.0)
     speed_kph = data.get("speed_kph", 30.0)
@@ -79,16 +95,17 @@ def compute_edge_weights(u, v, data, node_degree):
     time_s = data.get("travel_time", length_m / speed_ms)
     distance_m = length_m
 
-    grade_proxy = {"motorway": 0.0, "trunk": 0.1, "primary": 0.2}.get(highway_type(data), 0.3)
-    fuel_rate_per_km = 0.06 * (speed_kph ** 2) / 100 + 0.08 + grade_proxy * 0.02
-    fuel_cost = (length_m / 1000) * fuel_rate_per_km
+    # COPERT-style speed-dependent emission factor (g CO2/km, petrol car).
+    # Shape: high in slow traffic, lowest ~50 kph, rising at high speed.
+    # NOTE: coefficients are approximate; replace with the official COPERT
+    # table values for your vehicle class before citing exact numbers.
+    v = max(speed_kph, 5.0)
+    ef_g_per_km = 85 + 800 / v + 0.0035 * v ** 2
+    fuel_cost = (length_m / 1000) * ef_g_per_km  # grams CO2 (proxy for fuel)
 
     junction_density = min(node_degree.get(u, 1) + node_degree.get(v, 1), 12) / 12
-    lit = 0.0 if str(data.get("lit", "no")).lower() == "yes" else 1.0
-    road_risk = HIGHWAY_RISK.get(highway_type(data), 0.4)
-    speed_risk = min(speed_kph / 100, 1.0)
-    risk_rate_per_km = 0.25 * junction_density + 0.15 * lit + 0.4 * road_risk + 0.2 * speed_risk
-    accident_risk = (length_m / 1000) * risk_rate_per_km
+    data["jd"] = junction_density  # reused when traffic changes the speed
+    accident_risk = edge_risk(length_m, speed_kph, highway_type(data), junction_density)
 
     return time_s, distance_m, fuel_cost, accident_risk
 
@@ -114,14 +131,6 @@ def weighted_edge_cost(weights):
         return wt * d["time"] + wd * d["distance"] + wf * d["fuel"] + wr * d["risk"]
 
     return _cost
-
-
-def road_types_on_path(G, path):
-    types = set()
-    for u, v in zip(path[:-1], path[1:]):
-        d = min(G.get_edge_data(u, v).values(), key=lambda e: e.get("time", 1e9))
-        types.add(highway_type(d))
-    return types
 
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -232,9 +241,9 @@ class RouteDuplicateElimination(ElementwiseDuplicateElimination):
 # known public mirrors with backoff before giving up, instead of failing on
 # the first hiccup.
 OVERPASS_MIRRORS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://lz4.overpass-api.de/api/interpreter",
+    "https://overpass-api.de/api",
+    "https://overpass.kumi.systems/api",
+    "https://lz4.overpass-api.de/api",
 ]
 
 
@@ -242,7 +251,7 @@ def _download_graph_with_retries(center_lat, center_lon, radius_m, attempts_per_
     last_err = None
     for mirror in OVERPASS_MIRRORS:
         ox.settings.overpass_url = mirror
-        ox.settings.overpass_endpoint = mirror
+        ox.settings.overpass_endpoint = "interpreter"
         for attempt in range(attempts_per_mirror):
             try:
                 return ox.graph_from_point((center_lat, center_lon), dist=radius_m,
@@ -292,50 +301,52 @@ def geocode_place(query):
 
 
 # ----------------------------------------------------------------------------
-# Optional live traffic (TomTom) — only queries edges on the Pareto routes
+# Optional live traffic (TomTom) — sampled before optimization
 # ----------------------------------------------------------------------------
 
 
-def apply_live_traffic(G, routes, api_key):
-    """Re-fetch current speed for edges on the given routes only, and return an
-    array of updated costs (one row per route, same order as `routes`).
-    Never raises — falls back silently per edge on any API failure."""
+def apply_traffic_factors(G, api_key, n_samples=40):
+    """Sample TomTom at ~n_samples nodes, compute congestion factor
+    (current / free-flow speed), give each edge its nearest sample's factor,
+    and rescale time + fuel BEFORE optimization. Mutates G (pass a copy)."""
     import requests
+    from concurrent.futures import ThreadPoolExecutor
 
-    edges_seen = set()
-    for path in routes:
-        for u, v in zip(path[:-1], path[1:]):
-            edges_seen.add((u, v))
+    rng = random.Random(0)
+    nodes = rng.sample(list(G.nodes), min(n_samples, G.number_of_nodes()))
 
-    updated_times = {}
-    for (u, v) in edges_seen:
-        d = best_parallel_edge(G, u, v, weight="time")
-        lat, lon = G.nodes[u]["y"], G.nodes[u]["x"]
+    def fetch(n):
+        lat, lon = G.nodes[n]["y"], G.nodes[n]["x"]
         try:
-            resp = requests.get(
-                "https://api.tomtom.com/traffic/services/4/flowSegmentData/"
-                "absolute/10/json",
-                params={"point": f"{lat},{lon}", "key": api_key},
-                timeout=3,
-            )
-            resp.raise_for_status()
-            js = resp.json()
-            current_speed_kph = js["flowSegmentData"]["currentSpeed"]
-            if current_speed_kph and current_speed_kph > 0:
-                speed_ms = current_speed_kph * 1000 / 3600
-                updated_times[(u, v)] = d["distance"] / speed_ms
+            r = requests.get(
+                "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json",
+                params={"point": f"{lat},{lon}", "key": api_key}, timeout=4)
+            r.raise_for_status()
+            seg = r.json()["flowSegmentData"]
+            cur, free = seg["currentSpeed"], seg["freeFlowSpeed"]
+            if cur > 0 and free > 0:
+                return lat, lon, min(cur / free, 1.0)
         except Exception:
-            continue  # silent fallback to static time for this edge
+            pass
+        return None
 
-    new_costs = []
-    for path in routes:
-        totals = np.zeros(4)
-        for u, v in zip(path[:-1], path[1:]):
-            d = best_parallel_edge(G, u, v, weight="time")
-            t = updated_times.get((u, v), d["time"])
-            totals += [t, d["distance"], d["fuel"], d["risk"]]
-        new_costs.append(totals)
-    return np.array(new_costs), len(updated_times)
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        got = [g for g in ex.map(fetch, nodes) if g]
+    if len(got) < 5:
+        return "Live traffic unavailable — using speed-limit times."
+
+    pts = np.array([(g[0], g[1]) for g in got])
+    factors = np.array([g[2] for g in got])
+    for u, v, k, d in G.edges(keys=True, data=True):
+        lat = (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2
+        lon = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
+        i = int(np.argmin((pts[:, 0] - lat) ** 2 + (pts[:, 1] - lon) ** 2))
+        f = max(factors[i], 0.15)
+        d["time"] = d["time"] / f
+        eff = max(d["distance"] / d["time"] * 3.6, 5.0)  # effective kph
+        d["fuel"] = d["distance"] / 1000 * (85 + 800 / eff + 0.0035 * eff ** 2)
+        d["risk"] = edge_risk(d["distance"], eff, highway_type(d), d.get("jd", 0.5))
+    return f"Live traffic applied from {len(got)} sample points before route search."
 
 
 def recommend_route(pareto_costs, pareto_routes, priority_weights):
@@ -356,7 +367,7 @@ def path_to_coords(G, path):
 # ----------------------------------------------------------------------------
 
 
-def run_pipeline(from_query, to_query, radius_m):
+def run_pipeline(from_query, to_query, radius_m, traffic_key=None):
     from_pt = geocode_place(from_query)
     to_pt = geocode_place(to_query)
 
@@ -364,6 +375,10 @@ def run_pipeline(from_query, to_query, radius_m):
     center_lon = (from_pt[1] + to_pt[1]) / 2
 
     G = build_graph(round(center_lat, 4), round(center_lon, 4), radius_m)
+    traffic_note = None
+    if traffic_key:
+        G = G.copy()  # never mutate the cached graph
+        traffic_note = apply_traffic_factors(G, traffic_key)
 
     origin = ox.distance.nearest_nodes(G, X=from_pt[1], Y=from_pt[0])
     dest = ox.distance.nearest_nodes(G, X=to_pt[1], Y=to_pt[0])
@@ -429,6 +444,7 @@ def run_pipeline(from_query, to_query, radius_m):
         "G": G, "origin": origin, "dest": dest,
         "baseline_path": baseline_path,
         "pareto_routes": pareto_routes, "pareto_costs": pareto_costs,
+        "traffic_note": traffic_note,
     }
 
 
@@ -464,30 +480,36 @@ if priority_choice == "Advanced":
 else:
     priority_weights = PRIORITY_PRESETS[priority_choice]
 
-tomtom_key = st.secrets.get("TOMTOM_API_KEY", "") if hasattr(st, "secrets") else ""
+try:
+    tomtom_key = st.secrets.get("TOMTOM_API_KEY", "")
+except Exception:
+    tomtom_key = ""
 use_traffic = st.checkbox(
     "Use live traffic data (TomTom)", value=False, disabled=not bool(tomtom_key),
     help="Only available when a TOMTOM_API_KEY is configured in Streamlit secrets."
          if not tomtom_key else
-         "Re-fetches current speeds for edges on the Pareto routes only."
+         "Samples live traffic at ~40 points before the route search; click Find Route to apply."
 )
 
 find_clicked = st.button("Find Route", type="primary")
 
 # ----------------------------------------------------------------------------
-# Session state cache key: only rerun NSGA-III when from/to/radius change.
-# Switching priority (or the traffic toggle) just re-scores the same set.
+# Session state cache key: NSGA-III reruns only when Find Route is clicked.
+# Changing priority just re-scores the same Pareto set; changing from/to/radius/
+# traffic shows a warning until the search is rerun.
 # ----------------------------------------------------------------------------
 
 if find_clicked:
     if not from_input or not to_input:
         st.error("Please enter both a From and To location.")
     else:
-        cache_key = (from_input.strip().lower(), to_input.strip().lower(), radius_m)
+        cache_key = (from_input.strip().lower(), to_input.strip().lower(), radius_m,
+                     bool(use_traffic and tomtom_key))
         try:
             with st.spinner("Finding optimal routes... (downloading road network, "
                              "running NSGA-III — this can take 20–60s)"):
-                result = run_pipeline(from_input, to_input, radius_m)
+                result = run_pipeline(from_input, to_input, radius_m,
+                                      tomtom_key if use_traffic else None)
             st.session_state["optiroute_result"] = result
             st.session_state["optiroute_key"] = cache_key
         except ValueError as e:
@@ -500,6 +522,11 @@ if find_clicked:
 
 result = st.session_state.get("optiroute_result")
 
+if result is not None and st.session_state.get("optiroute_key") != (
+        from_input.strip().lower(), to_input.strip().lower(), radius_m,
+        bool(use_traffic and tomtom_key)):
+    st.warning("Inputs changed since the last search — click **Find Route** to update.")
+
 if result is not None:
     G = result["G"]
     pareto_routes = result["pareto_routes"]
@@ -509,19 +536,7 @@ if result is not None:
 
     baseline_cost = route_cost(G, baseline_path)
 
-    traffic_note = None
-    if use_traffic and tomtom_key:
-        try:
-            with st.spinner("Fetching live traffic for candidate routes..."):
-                # Include baseline in the same lookup so it's judged on the same
-                # real-time basis as the Pareto routes, not left on static speed-limit time.
-                all_routes = pareto_routes + [baseline_path]
-                new_costs, n_updated = apply_live_traffic(G, all_routes, tomtom_key)
-            pareto_costs = new_costs[:-1]
-            baseline_cost = new_costs[-1]
-            traffic_note = f"Live traffic applied to {n_updated} road segments (including baseline)."
-        except Exception:
-            traffic_note = "Live traffic lookup failed — showing static speed-limit times."
+    traffic_note = result.get("traffic_note")
 
     best_idx, best_path, best_cost = recommend_route(pareto_costs, pareto_routes, priority_weights)
 
@@ -553,7 +568,7 @@ if result is not None:
 
     df = pd.DataFrame(
         [{"Route": name, "Time (s)": round(c[0], 1), "Distance (m)": round(c[1], 1),
-          "Fuel": round(c[2], 3), "Risk": round(c[3], 3)} for name, c in rows]
+          "Fuel (g CO2)": round(c[2], 1), "Risk": round(c[3], 3)} for name, c in rows]
     )
     st.dataframe(df, hide_index=True, use_container_width=True)
 
@@ -573,7 +588,7 @@ if result is not None:
         st.markdown("This route is also the fastest one in the Pareto set for this trip.")
 
     # --- Pareto front chart
-    st.subheader("Pareto front: Time vs. Accident Risk (color = Fuel Cost)")
+    st.subheader("Pareto front: Time vs. Accident Risk (color = Fuel, g CO2)")
     fig, ax = plt.subplots(figsize=(7, 5))
     sc = ax.scatter(pareto_costs[:, 0], pareto_costs[:, 3], c=pareto_costs[:, 2],
                      cmap="viridis", s=80, edgecolor="k")
@@ -581,7 +596,7 @@ if result is not None:
                label=f"Recommended ({priority_choice})", zorder=5)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Accident Risk (relative)")
-    plt.colorbar(sc, label="Fuel Cost", ax=ax)
+    plt.colorbar(sc, label="Fuel (g CO2)", ax=ax)
     ax.legend()
     plt.tight_layout()
     st.pyplot(fig)
